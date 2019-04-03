@@ -16,6 +16,15 @@ from snowflake.connector import ProgrammingError
 log = logging.getLogger(__name__)
 
 
+def _execute_query(connection, query):
+    try:
+        connection.cursor().execute(query)
+    except ProgrammingError as e:
+        # Display the query along with the stack trace.
+        import sys
+        raise type(e), type(e)(str(e) + "\nQuery: %s\n" % query), sys.exc_info()[2]
+
+
 class SnowflakeTarget(luigi.Target):
     """
     Target for a resource in Snowflake.
@@ -32,7 +41,7 @@ class SnowflakeTarget(luigi.Target):
             self.account = creds.get('account')
             self.aws_key_id = creds.get('aws_key_id')
             self.aws_secret_key = creds.get('aws_secret_key')
-            self.database = database
+            self.sf_database = database
             self.schema = schema
             self.table = table
             self.role = role
@@ -79,8 +88,7 @@ class SnowflakeTarget(luigi.Target):
         MIN_CLUSTER_COUNT = 1 MAX_CLUSTER_COUNT = 2 SCALING_POLICY = 'STANDARD'
         INITIALLY_SUSPENDED = TRUE
         """.format(warehouse=self.warehouse)
-        log.debug(query)
-        cursor.execute(query)
+        _execute_query(connection, query)
 
     def touch(self, connection):
         """
@@ -89,14 +97,16 @@ class SnowflakeTarget(luigi.Target):
 
         self.create_marker_table()
 
-        connection.cursor().execute(
-            """INSERT INTO {database}.{schema}.{marker_table} (update_id, target_table)
-               VALUES (%s, %s)""".format(database=self.database, schema=self.schema, marker_table=self.marker_table),
-            (self.update_id, "{database}.{schema}.{table}".format(database=self.database, schema=self.schema, table=self.table))
+        query = """
+        INSERT INTO {database}.{schema}.{marker_table} (update_id, target_table)
+        VALUES ('{update_id}', '{database}.{schema}.{table}')""".format(
+            update_id=str(self.update_id),
+            database=self.sf_database,
+            schema=self.schema,
+            marker_table=self.marker_table,
+            table=self.table
         )
-
-        # make sure update is properly marked
-        assert self.exists(connection)
+        _execute_query(connection, query)
 
     def exists(self, connection=None):
         close_connection = False
@@ -112,8 +122,14 @@ class SnowflakeTarget(luigi.Target):
                 return False
 
             cursor = connection.cursor()
-            query = "SELECT 1 FROM {database}.{schema}.{marker_table} WHERE update_id='{update_id}' AND target_table='{database}.{schema}.{table}'".format(
-                database=self.database, schema=self.schema, marker_table=self.marker_table, update_id=self.update_id, table=self.table)
+            query = """SELECT 1 FROM {database}.{schema}.{marker_table} WHERE update_id='{update_id}'
+            AND target_table='{database}.{schema}.{table}'""".format(
+                database=self.sf_database,
+                schema=self.schema,
+                marker_table=self.marker_table,
+                update_id=self.update_id,
+                table=self.table
+            )
             log.debug(query)
             cursor.execute(query)
             row = cursor.fetchone()
@@ -131,7 +147,7 @@ class SnowflakeTarget(luigi.Target):
         try:
             cursor.execute("SHOW TABLES LIKE '{marker_table}' IN SCHEMA {database}.{schema}".format(
                 marker_table=self.marker_table,
-                database=self.database,
+                database=self.sf_database,
                 schema=self.schema,
             ))
             row = cursor.fetchone()
@@ -150,7 +166,6 @@ class SnowflakeTarget(luigi.Target):
         """
 
         connection = self.connect(autocommit=True)
-        cursor = connection.cursor()
         query = """
         CREATE TABLE IF NOT EXISTS {database}.{schema}.{marker_table} (
             id            INT AUTOINCREMENT,
@@ -159,10 +174,8 @@ class SnowflakeTarget(luigi.Target):
             inserted      TIMESTAMP DEFAULT CURRENT_TIMESTAMP()::timestamp_ntz,
             PRIMARY KEY (update_id, id)
         )
-        """.format(database=self.database, schema=self.schema, marker_table=self.marker_table)
-        log.debug(query)
-        cursor.execute(query)
-        connection.close()
+        """.format(database=self.sf_database, schema=self.schema, marker_table=self.marker_table)
+        _execute_query(connection, query)
 
     def clear_marker_table(self, connection):
         """
@@ -170,9 +183,9 @@ class SnowflakeTarget(luigi.Target):
         """
         if self.marker_table_exists(connection):
             query = "DELETE FROM {database}.{schema}.{marker_table} where target_table='{database}.{schema}.{table}'".format(
-                database=self.database, schema=self.schema, marker_table=self.marker_table, table=self.table,
+                database=self.sf_database, schema=self.schema, marker_table=self.marker_table, table=self.table,
             )
-            connection.cursor().execute(query)
+            _execute_query(connection, query)
 
 
 class SnowflakeLoadDownstreamMixin(OverwriteOutputMixin):
@@ -181,10 +194,10 @@ class SnowflakeLoadDownstreamMixin(OverwriteOutputMixin):
     """
 
     credentials = luigi.Parameter(description='Path to the external access credentials file.')
-    database = luigi.Parameter(description='The name of the database to which to write.')
-    schema = luigi.Parameter(description='The name of the schema to which to write.')
-    warehouse = luigi.Parameter(description='Name of virtual warehouse to use.')
-    role = luigi.Parameter(description='User role used to execute DDL/DML statements')
+    sf_database = luigi.Parameter(description='Name of the Snowflake database to which to write.')
+    schema = luigi.Parameter(description='Name of the Snowflake schema to which to write.')
+    warehouse = luigi.Parameter(description='Name of Snowflake virtual warehouse to use.')
+    role = luigi.Parameter(description='Snowflake user role used to execute DDL/DML statements')
 
 
 class SnowflakeLoadTask(SnowflakeLoadDownstreamMixin, luigi.Task):
@@ -254,22 +267,33 @@ class SnowflakeLoadTask(SnowflakeLoadDownstreamMixin, luigi.Task):
         """
         return ".*"
 
+    @property
+    def table_description(self):
+        """
+        Description of table containing various facts, such as import time and excluded fields.
+        """
+        return ''
+
     def create_database(self, connection):
-        cursor = connection.cursor()
-        cursor.execute("CREATE DATABASE IF NOT EXISTS {database}".format(database=self.database))
+        query = "CREATE DATABASE IF NOT EXISTS {database}".format(database=self.sf_database)
+        _execute_query(connection, query)
 
     def create_schema(self, connection):
-        cursor = connection.cursor()
-        cursor.execute("CREATE SCHEMA IF NOT EXISTS {database}.{schema}".format(database=self.database, schema=self.schema))
+        query = "CREATE SCHEMA IF NOT EXISTS {database}.{schema}".format(database=self.sf_database, schema=self.schema)
+        _execute_query(connection, query)
 
     def create_table(self, connection):
         coldefs = ','.join(
             '{name} {definition}'.format(name=name, definition=definition) for name, definition in self.columns
         )
-        query = "CREATE TABLE IF NOT EXISTS {database}.{schema}.{table} ({coldefs})".format(
-            database=self.database, schema=self.schema, table=self.table, coldefs=coldefs
+        query = "CREATE TABLE IF NOT EXISTS {database}.{schema}.{table} ({coldefs}) COMMENT='{comment}'".format(
+            database=self.sf_database,
+            schema=self.schema,
+            table=self.table,
+            coldefs=coldefs,
+            comment=self.table_description.replace("'", "\\'")
         )
-        connection.cursor().execute(query)
+        _execute_query(connection, query)
 
     def create_format(self, connection):
         """
@@ -282,14 +306,13 @@ class SnowflakeLoadTask(SnowflakeLoadDownstreamMixin, luigi.Task):
         EMPTY_FIELD_AS_NULL = FALSE ESCAPE_UNENCLOSED_FIELD = 'NONE'
         NULL_IF = ('{null_marker}')
         """.format(
-            database=self.database,
+            database=self.sf_database,
             schema=self.schema,
             file_format_name=self.file_format_name,
             field_delimiter=self.field_delimiter,
             null_marker=self.null_marker,
         )
-        log.debug(query)
-        connection.cursor().execute(query)
+        _execute_query(connection, query)
 
     def create_stage(self, connection):
         """
@@ -297,20 +320,21 @@ class SnowflakeLoadTask(SnowflakeLoadDownstreamMixin, luigi.Task):
         """
         stage_url = self.input()['insert_source_task'].path
         query = """
-        CREATE OR REPLACE STAGE {database}.{schema}.{table}_stage
+        CREATE OR REPLACE STAGE {database}.{schema}.{table}_{date}_stage
             URL = '{stage_url}'
             CREDENTIALS = (AWS_KEY_ID='{aws_key_id}' AWS_SECRET_KEY='{aws_secret_key}')
             FILE_FORMAT = {database}.{schema}.{file_format_name};
         """.format(
-            database=self.database,
+            database=self.sf_database,
             schema=self.schema,
             table=self.table,
+            date=self.date.strftime('%Y_%m_%d'),
             stage_url=stage_url,
             aws_key_id=self.output().aws_key_id,
             aws_secret_key=self.output().aws_secret_key,
             file_format_name=self.file_format_name,
         )
-        connection.cursor().execute(query)
+        _execute_query(connection, query)
 
     def init_copy(self, connection):
         self.attempted_removal = True
@@ -320,22 +344,25 @@ class SnowflakeLoadTask(SnowflakeLoadDownstreamMixin, luigi.Task):
 
             # Historically we've used DELETE as TRUNCATE would cause an implicit commit.
             # But with Snowflake TRUNCATE doesn't seem to cause and implicit commit.
-            connection.cursor().execute("TRUNCATE TABLE {database}.{schema}.{table}".format(
-                database=self.database, schema=self.schema, table=self.table
-            ))
+            query = "TRUNCATE TABLE {database}.{schema}.{table}".format(
+                database=self.sf_database, schema=self.schema, table=self.table
+            )
+            _execute_query(connection, query)
 
     def copy(self, connection):
         query = """
         COPY INTO {database}.{schema}.{table}
-        FROM @{database}.{schema}.{table}_stage
+        FROM @{database}.{schema}.{table}_{date}_stage
         PATTERN='{pattern}'
         """.format(
-            database=self.database,
+            database=self.sf_database,
             schema=self.schema,
             table=self.table,
+            date=self.date.strftime('%Y_%m_%d'),
             pattern=self.pattern,
         )
-        connection.cursor().execute(query)
+        log.debug(query)
+        _execute_query(connection, query)
 
     def run(self):
         connection = self.output().connect()
@@ -365,7 +392,7 @@ class SnowflakeLoadTask(SnowflakeLoadDownstreamMixin, luigi.Task):
         if self.output_target is None:
             self.output_target = SnowflakeTarget(
                 credentials_target=self.input()['credentials'],
-                database=self.database,
+                database=self.sf_database,
                 schema=self.schema,
                 table=self.table,
                 role=self.role,
